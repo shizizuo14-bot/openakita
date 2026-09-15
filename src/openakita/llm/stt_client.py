@@ -29,6 +29,14 @@ SUPPORTED_AUDIO_FORMATS = {"mp3", "mp4", "mpeg", "mpga", "m4a", "wav", "webm", "
 
 _DASHSCOPE_ASR_PROVIDERS = {"dashscope", "dashscope-intl"}
 
+# MiniMax 用 POST /v1/speech_to_text（multipart/form-data 上传文件），
+# 与 OpenAI 的 /audio/transcriptions 形状不同：language 走请求头（BCP-47），
+# 响应是 {"text": ..., "duration": ..., "trace_id": ...}。
+_MINIMAX_ASR_PROVIDERS = {"minimax", "minimax-cn", "minimax-int"}
+_MINIMAX_ASR_API_TYPES = {"minimax", "minimax_asr", "minimax_speech_to_text"}
+# 官方文档给出的受支持容器（裸 PCM 不支持）。
+_MINIMAX_AUDIO_FORMATS = {"wav", "aiff", "aif", "flac", "alac", "m4a", "mp3", "aac", "opus", "ogg"}
+
 _AUDIO_MIME_MAP = {
     ".mp3": "audio/mpeg",
     ".mp4": "audio/mp4",
@@ -49,6 +57,23 @@ def _is_dashscope_asr(endpoint: EndpointConfig) -> bool:
     if provider in _DASHSCOPE_ASR_PROVIDERS and "asr" in model:
         return True
     return False
+
+
+def _is_minimax_asr(endpoint: EndpointConfig) -> bool:
+    """判断端点是否需要走 MiniMax /speech_to_text 协议
+
+    三种识别方式（任一命中即可），方便用户只填 base_url 也能work：
+    1. api_type 显式声明 minimax*；
+    2. provider 是 minimax / minimax-cn / minimax-int；
+    3. base_url 里含 "minimax"（用户从配置中心复制的 OpenAI 兼容端点常是这种）。
+    """
+    api_type = (endpoint.api_type or "").lower()
+    if api_type in _MINIMAX_ASR_API_TYPES:
+        return True
+    provider = (endpoint.provider or "").lower()
+    if provider in _MINIMAX_ASR_PROVIDERS:
+        return True
+    return "minimax" in (endpoint.base_url or "").lower()
 
 
 class STTClient:
@@ -129,6 +154,8 @@ class STTClient:
         """调用单个 STT 端点，自动选择协议"""
         if _is_dashscope_asr(endpoint):
             return await self._call_dashscope_asr(endpoint, audio_file, language, timeout)
+        if _is_minimax_asr(endpoint):
+            return await self._call_minimax_asr(endpoint, audio_file, language, timeout)
         return await self._call_openai_transcriptions(endpoint, audio_file, language, timeout)
 
     async def _call_openai_transcriptions(
@@ -230,5 +257,68 @@ class STTClient:
                 resp.raise_for_status()
                 result = resp.json()
                 return result["choices"][0]["message"]["content"]
+
+        return await loop.run_in_executor(None, _do_request)
+
+    async def _call_minimax_asr(
+        self,
+        endpoint: EndpointConfig,
+        audio_file: Path,
+        language: str | None,
+        timeout: int,
+    ) -> str | None:
+        """MiniMax /speech_to_text 协议（multipart/form-data 上传音频文件）
+
+        约束（来自官方文档）：时长 ≤ 500s、体积 ≤ 50MB，
+        格式限 wav / aiff / flac / m4a(alac) / mp3 / aac / opus / ogg。
+        """
+        import httpx
+
+        api_key = endpoint.get_api_key()
+        if not api_key:
+            logger.warning(f"[STT] No API key for endpoint {endpoint.name}")
+            return None
+
+        base_url = normalize_base_url(endpoint.base_url, extra_suffixes=("/speech_to_text",))
+        url = f"{base_url}/speech_to_text"
+        model = endpoint.model or "asr-1.0"
+
+        suffix = audio_file.suffix.lower().lstrip(".")
+        if suffix and suffix not in _MINIMAX_AUDIO_FORMATS:
+            logger.warning(
+                "[STT] MiniMax may reject '.%s' audio (supported: %s)",
+                suffix,
+                sorted(_MINIMAX_AUDIO_FORMATS),
+            )
+
+        size_mb = audio_file.stat().st_size / (1024 * 1024)
+        if size_mb > 50:
+            logger.warning(
+                "[STT] MiniMax rejects audio larger than 50MB (this file is %.1fMB)", size_mb
+            )
+
+        # 注意：language 是请求头（BCP-47），不是表单字段。
+        headers = {"Authorization": f"Bearer {api_key}"}
+        if language:
+            headers["language"] = language
+
+        files = {"file": (audio_file.name, audio_file.read_bytes(), "application/octet-stream")}
+        data = {"model": model, "response_format": "json"}
+
+        loop = asyncio.get_event_loop()
+
+        def _do_request():
+            with httpx.Client(timeout=timeout) as client:
+                resp = client.post(url, headers=headers, files=files, data=data)
+                resp.raise_for_status()
+                result = resp.json()
+                # MiniMax 把业务错误塞在 200 响应里，必须显式检查。
+                base_resp = result.get("base_resp") or {}
+                status_code = base_resp.get("status_code")
+                if status_code not in (None, 0):
+                    raise RuntimeError(
+                        f"MiniMax ASR error {status_code}: {base_resp.get('status_msg')}"
+                    )
+                return result.get("text", "")
 
         return await loop.run_in_executor(None, _do_request)

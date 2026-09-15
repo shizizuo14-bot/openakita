@@ -2198,9 +2198,7 @@ class ReasoningEngine:
                     if _current_discovered != _last_discovered_snapshot:
                         _last_discovered_snapshot = _current_discovered
                         refreshed = _filter_tools_by_mode(_agent._effective_tools, _effective_mode)
-                        # Discovery changes schema visibility (_deferred), not
-                        # necessarily tool names: deferred tools remain in both lists.
-                        if refreshed != tools:
+                        if {t.get("name") for t in refreshed} != {t.get("name") for t in tools}:
                             tools = refreshed
                             _allowed_tool_names = (
                                 {t.get("name", "") for t in tools}
@@ -3863,58 +3861,59 @@ class ReasoningEngine:
 
                         # Plan 事件
                         if tool_name == "create_todo" and isinstance(tool_args, dict):
-                            raw_steps = tool_args.get("steps", [])
-                            plan_steps = []
-                            for idx, s in enumerate(raw_steps):
-                                if isinstance(s, dict):
-                                    plan_steps.append(
-                                        {
-                                            "id": str(s.get("id", f"step_{idx + 1}")),
-                                            "description": str(
-                                                s.get("description", s.get("id", ""))
-                                            ),
-                                            "status": "pending",
-                                        }
-                                    )
-                                else:
-                                    plan_steps.append(
-                                        {
-                                            "id": f"step_{idx + 1}",
-                                            "description": str(s),
-                                            "status": "pending",
-                                        }
-                                    )
-                            # 从后端获取真实 plan_id，保持前后端 ID 一致
-                            _sse_plan_id = str(uuid.uuid4())
-                            try:
-                                from ..tools.handlers.plan import get_active_plan_id
+                            # 与 todo_handler._create_todo 共用同一套归一化：
+                            # 模型常按 Claude Code 的 TodoWrite 风格输出
+                            # （title / steps[].step），两侧若各自解析不一致，
+                            # 前端卡片就会渲染成只有序号和 0/N 的空壳。
+                            from ..tools.handlers.todo_normalize import (
+                                coerce_steps_payload,
+                                normalize_plan_step,
+                                normalize_task_summary,
+                            )
 
-                                _real_id = get_active_plan_id(conversation_id)
-                                if _real_id:
-                                    _sse_plan_id = _real_id
-                            except Exception:
-                                pass
-                            yield {
-                                "type": "todo_created",
-                                "plan": {
-                                    "id": _sse_plan_id,
-                                    "taskSummary": tool_args.get("task_summary", ""),
-                                    "steps": plan_steps,
-                                    "status": "in_progress",
-                                },
-                            }
+                            raw_steps = coerce_steps_payload(tool_args.get("steps"))
+                            plan_steps = (
+                                [
+                                    normalize_plan_step(s, idx)
+                                    for idx, s in enumerate(raw_steps)
+                                ]
+                                if raw_steps is not None
+                                else []
+                            )
+                            if plan_steps:
+                                # 从后端获取真实 plan_id，保持前后端 ID 一致
+                                _sse_plan_id = str(uuid.uuid4())
+                                try:
+                                    from ..tools.handlers.plan import get_active_plan_id
+
+                                    _real_id = get_active_plan_id(conversation_id)
+                                    if _real_id:
+                                        _sse_plan_id = _real_id
+                                except Exception:
+                                    pass
+                                yield {
+                                    "type": "todo_created",
+                                    "plan": {
+                                        "id": _sse_plan_id,
+                                        "taskSummary": normalize_task_summary(tool_args),
+                                        "steps": plan_steps,
+                                        "status": "in_progress",
+                                    },
+                                }
                         elif tool_name == "create_plan_file" and isinstance(tool_args, dict):
-                            pf_todos = tool_args.get("todos", [])
-                            pf_steps = []
-                            for idx, t in enumerate(pf_todos):
-                                if isinstance(t, dict):
-                                    pf_steps.append(
-                                        {
-                                            "id": str(t.get("id", f"step_{idx + 1}")),
-                                            "description": str(t.get("content", t.get("id", ""))),
-                                            "status": "pending",
-                                        }
-                                    )
+                            from ..tools.handlers.todo_normalize import (
+                                coerce_steps_payload,
+                                normalize_plan_step,
+                                normalize_task_summary,
+                            )
+
+                            pf_todos = coerce_steps_payload(
+                                tool_args.get("todos", tool_args.get("steps"))
+                            )
+                            pf_steps = [
+                                normalize_plan_step(t, idx)
+                                for idx, t in enumerate(pf_todos or [])
+                            ]
                             if pf_steps:
                                 _pf_plan_id = ""
                                 try:
@@ -3927,7 +3926,7 @@ class ReasoningEngine:
                                     "type": "todo_created",
                                     "plan": {
                                         "id": _pf_plan_id or str(uuid.uuid4()),
-                                        "taskSummary": tool_args.get("name", ""),
+                                        "taskSummary": normalize_task_summary(tool_args),
                                         "steps": pf_steps,
                                         "status": "in_progress",
                                     },

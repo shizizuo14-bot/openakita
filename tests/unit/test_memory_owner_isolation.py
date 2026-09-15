@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import sqlite3
 from datetime import datetime
 from types import SimpleNamespace
@@ -490,3 +491,61 @@ def test_memory_graph_is_filtered_by_current_owner(tmp_path):
     assert graph.status_code == 200
     nodes = graph.json()["nodes"]
     assert [n["id"] for n in nodes] == ["node-a"]
+
+
+def _session_messages(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if "[Memory] start_session" in r.getMessage()]
+
+
+def test_local_session_does_not_report_default_identity_as_a_problem(tmp_path, caplog):
+    """CLI / desktop sessions carry no identity, and ``default`` is their owner.
+
+    Regression: ``start_session(session_id)`` warned about ``user_id='default'``
+    even though the caller never supplied an identity, so every local start
+    looked like a tenancy misconfiguration. ``default`` is the legitimate
+    single-user desktop identity — see
+    ``lifecycle._resolve_tenant_for_session``'s v4 semantics.
+    """
+    manager = _manager(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="openakita.memory.manager"):
+        manager.start_session("local-session")
+
+    messages = _session_messages(caplog)
+    assert not [m for m in messages if "fallback user_id" in m], (
+        "a local single-user session must not be reported as a tenancy problem"
+    )
+    assert any("tenant=(user=default workspace=default)" in m for m in messages)
+
+
+def test_tenancy_aware_caller_that_degraded_to_default_still_warns(tmp_path, caplog):
+    """A channel that supplied an identity but degraded to ``default`` must warn.
+
+    This keeps the multi-tenant safety signal intact: silently sharing one
+    long-term memory across every caller is the failure the warning exists for.
+    """
+    manager = _manager(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="openakita.memory.manager"):
+        manager.start_session("im-session", user_id="default", workspace_id="default")
+
+    warnings = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and "fallback user_id" in r.getMessage()
+    ]
+    assert warnings, (
+        "an upstream channel that passed an identity must not silently share long-term memory"
+    )
+
+
+def test_tenancy_aware_caller_with_real_identity_stays_quiet(tmp_path, caplog):
+    """A channel that supplies a real OpenID logs the tenant without warning."""
+    manager = _manager(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="openakita.memory.manager"):
+        manager.start_session("im-session", user_id="openid-abc123", workspace_id="default")
+
+    messages = _session_messages(caplog)
+    assert not [m for m in messages if "fallback user_id" in m]
+    assert any("tenant=(user=openid-abc123 workspace=default)" in m for m in messages)

@@ -73,6 +73,7 @@ _NON_TOOL_HANDLER_FILES: dict[str, str] = {
     "todo_state.py": "internal state helper for plan/todo handler",
     "todo_store.py": "persistence helper, no TOOLS",
     "todo_heuristics.py": "heuristic helper, no TOOLS",
+    "todo_normalize.py": "pure payload-normalization helpers, no TOOLS",
     "plan.py": "back-compat re-export shim of todo_handler.py",
 }
 

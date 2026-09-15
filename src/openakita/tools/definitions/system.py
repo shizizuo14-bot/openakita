@@ -7,6 +7,7 @@ System 工具定义
 - get_session_logs: 获取会话日志
 - get_tool_info: 获取工具详细信息
 - generate_image: AI 生成图片
+- generate_speech: AI 生成语音（TTS）
 - set_task_timeout: 调整任务超时策略
 - get_workspace_map: 获取工作区目录结构和关键路径
 """
@@ -282,6 +283,69 @@ SYSTEM_TOOLS = [
                 },
             },
             "required": ["prompt"],
+        },
+    },
+    {
+        "name": "generate_speech",
+        "category": "System",
+        "description": (
+            "Synthesize speech (text-to-speech) from a text string using the configured "
+            "TTS model API, saving the audio to a local file.\n\n"
+            "STRICT: Only use this tool when the user explicitly asks for an audio version, "
+            "voice-over, narration or dubbing. Do NOT synthesize speech 'just to be helpful'.\n\n"
+            "The result is a real audio file that MUST be delivered with deliver_artifacts."
+        ),
+        "detail": """语音合成（TTS）：把文本合成为音频并保存为本地文件。
+
+说明：
+- 使用配置中心的 TTS 端点（`data/llm_endpoints.json` → `tts_endpoints`），当前支持 MiniMax `/v1/t2a_v2`。
+- 未指定端点时按优先级调用，并在失败后自动切换到下一个已启用端点。
+- 文本上限约 10000 字符；超过 3000 字符建议分段合成后拼接。
+- 支持停顿标记 `<#x#>`（x 为秒，范围 0.01~99.99，不可连续使用），以及行内发音微调，
+  例如 `处理/(chu3)(li3)`、`这个是 (he2)平`。
+
+输出：
+- 返回 JSON 字符串，包含 `saved_to`（本地路径）、`duration_ms`、`audio_format`、`voice_id`。
+
+交付：
+- 如需把音频发到 IM，请再调用 `deliver_artifacts`，并以回执作为交付证据。""",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "要合成的文本（必填）"},
+                "endpoint": {
+                    "type": "string",
+                    "description": "TTS 端点名称（可选；不填则按配置优先级自动选择并故障转移）",
+                },
+                "model": {
+                    "type": "string",
+                    "description": "临时覆盖端点默认模型（可选，如 speech-2.8-hd / speech-2.8-turbo）",
+                },
+                "voice_id": {
+                    "type": "string",
+                    "description": "音色 ID（可选；不填使用端点默认音色，如 male-qn-qingse）",
+                },
+                "speed": {"type": "number", "description": "语速（可选，约 0.5~2，1 为原速）"},
+                "vol": {"type": "number", "description": "音量（可选，约 0~10，1 为原音量）"},
+                "pitch": {"type": "integer", "description": "音调（可选，约 -12~12，0 为原调）"},
+                "emotion": {
+                    "type": "string",
+                    "description": "情绪（可选，如 happy/sad/angry/fearful/disgusted/surprised/neutral）",
+                },
+                "audio_format": {
+                    "type": "string",
+                    "description": "输出音频格式（可选，mp3/wav/flac/pcm）",
+                },
+                "language_boost": {
+                    "type": "string",
+                    "description": "小语种/方言增强（可选，如 Chinese、Chinese,Yue、auto）",
+                },
+                "output_path": {
+                    "type": "string",
+                    "description": "保存路径（可选）。不填则在当前工作目录下自动命名",
+                },
+            },
+            "required": ["text"],
         },
     },
     {

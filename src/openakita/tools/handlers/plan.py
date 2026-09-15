@@ -7,10 +7,12 @@
 - todo_state.py:      Session 状态管理 + 生命周期函数
 - todo_heuristics.py:  多步骤任务启发式检测
 - todo_handler.py:     PlanHandler 类 + create_todo_handler 工厂
+- todo_normalize.py:   plan 载荷归一化（规范字段 + 模型别名容错，单一事实来源）
 """
 
 from .todo_handler import *  # noqa: F401,F403
 from .todo_heuristics import *  # noqa: F401,F403
+from .todo_normalize import *  # noqa: F401,F403
 from .todo_state import *  # noqa: F401,F403
 
 # 显式确保过渡期私有符号可被外部 import（不依赖 __all__）

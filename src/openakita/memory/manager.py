@@ -685,9 +685,14 @@ class MemoryManager:
         # P1-5：每次切换会话时显式记录当前 (user_id, workspace_id) 范围，
         # 让运维能从日志直接看出"本会话能看见的长期记忆来自哪个租户"，
         # 排查跨用户串扰时不必再去翻代码或 DB。
-        # 同时 user_id 仍为默认 "default" 时降级为 warning：在多用户 IM 通道下
-        # 这往往意味着上游忘了把真实 OpenID 传下来，会导致所有人共用同一份长期记忆。
-        if self._current_user_id in ("default", "anonymous", ""):
+        #
+        # 仅在调用方**显式传入过身份**时才升级为 warning：那意味着多用户 IM
+        # 通道忘了把真实 OpenID 传下来，会导致所有人共用同一份长期记忆。
+        # 而 CLI / 桌面单用户走的是 ``start_session(session_id)``（不传身份），
+        # 此时 ``user_id == "default"`` 是合法的单用户桌面身份——参见
+        # ``lifecycle._resolve_tenant_for_session`` 的 v4 语义——不该报警。
+        identity_supplied = user_id is not _UNSET_OWNER or workspace_id is not _UNSET_OWNER
+        if identity_supplied and self._current_user_id in ("default", "anonymous", ""):
             logger.warning(
                 "[Memory] start_session(%s) using fallback user_id=%r workspace_id=%r — "
                 "long-term memories will be shared across all 'default' callers; "

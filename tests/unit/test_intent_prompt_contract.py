@@ -24,7 +24,9 @@ from openakita.core.intent_analyzer import (
     MemoryScope,
     PromptDepth,
     _make_default,
+    _normalize_compiler_output,
     _parse_intent_output,
+    _validate_intent_yaml,
 )
 from openakita.llm.types import (
     LOCAL_ENDPOINT_DEFAULT_CONTEXT_WINDOW,
@@ -1012,3 +1014,73 @@ def test_org_coordinator_resolves_force_tool_policy_even_for_writing_request():
     assert evidence_required is False, (
         "force_tool 路径不再硬绑定 evidence_required，避免阶段 0 disclaimer 重复触发。"
     )
+
+
+# ---------------------------------------------------------------------------
+# Compiler output normalization
+#
+# Regression: the analyzer used to strip only ``<thinking>``. Providers that
+# emit ``<think>`` (MiniMax M-series among them) had their entire reasoning
+# block survive, so ``_validate_intent_yaml`` rejected the envelope with
+# ``non_yaml_text_at_line_1`` on *every* request and the analyzer silently
+# degraded to ``_make_default``.
+# ---------------------------------------------------------------------------
+
+_ENVELOPE = (
+    "intent: task\n"
+    "task_type: analysis\n"
+    "goal: 统计 install3.log 中的报错信息\n"
+    "tool_hints: [File System]\n"
+    "memory_keywords: [openakita, install3.log]\n"
+    "capability_scope: [files]\n"
+    "knowledge_lookup: false\n"
+    "evidence_required: true"
+)
+
+
+def test_normalize_compiler_output_handles_provider_wrappers():
+    assert _normalize_compiler_output("") == ""
+
+    # Anthropic-style and MiniMax-style reasoning blocks.
+    assert _normalize_compiler_output(f"<thinking>why</thinking>\n{_ENVELOPE}") == _ENVELOPE
+    assert _normalize_compiler_output(f"<think>why</think>\n{_ENVELOPE}") == _ENVELOPE
+
+    # Unclosed block: the leftover reasoning is preamble and must be discarded.
+    assert _normalize_compiler_output(f"<think>why\nmore\n{_ENVELOPE}") == _ENVELOPE
+
+    # Markdown fences, alone and combined with a reasoning block.
+    assert _normalize_compiler_output(f"```yaml\n{_ENVELOPE}\n```") == _ENVELOPE
+    assert _normalize_compiler_output(f"<think>why</think>\n```yaml\n{_ENVELOPE}\n```") == _ENVELOPE
+
+    # Already-clean output is returned untouched.
+    assert _normalize_compiler_output(_ENVELOPE) == _ENVELOPE
+
+    # Prose without any envelope must NOT be rescued into a valid contract.
+    assert not _validate_intent_yaml(_normalize_compiler_output("just prose\nno envelope"))[0]
+
+
+def test_normalized_wrappers_satisfy_the_yaml_contract():
+    for raw in (
+        f"<think>why</think>\n{_ENVELOPE}",
+        f"<thinking>why</thinking>\n{_ENVELOPE}",
+        f"<think>why\n{_ENVELOPE}",
+        f"```yaml\n{_ENVELOPE}\n```",
+    ):
+        valid, error = _validate_intent_yaml(_normalize_compiler_output(raw))
+        assert valid, f"expected valid contract, got {error!r} for {raw[:40]!r}"
+
+
+async def test_minimax_think_block_does_not_degrade_intent_analysis():
+    """A ``<think>`` prefix must not cost a repair round or the safe default."""
+
+    brain = _StaticCompilerBrain(f"<think>The user wants log analysis.</think>\n\n{_ENVELOPE}")
+
+    result = await IntentAnalyzer(brain).analyze("统计 install3.log 里的报错")
+
+    assert brain.calls == 1, "normalization should make the repair round unnecessary"
+    assert result.intent == IntentType.TASK
+    assert result.task_type == "analysis"
+    assert result.evidence_required is True
+    assert result.force_tool is True
+    assert result.compiler_fallback_reason == "", "must not degrade to the safe default"
+    assert "think" not in result.raw_output

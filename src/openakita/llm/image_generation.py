@@ -12,7 +12,40 @@ import httpx
 from .endpoint_manager import EndpointManager
 from .types import EndpointConfig
 
-SUPPORTED_IMAGE_API_TYPES = {"dashscope", "openai_images"}
+SUPPORTED_IMAGE_API_TYPES = {"dashscope", "openai_images", "minimax"}
+
+# MiniMax's text-to-image API takes an `aspect_ratio` enum instead of a
+# pixel size, so a requested "1664x928" has to be snapped to the closest
+# ratio the vendor accepts. Order matters only for readability — the
+# lookup picks the numerically closest match.
+_MINIMAX_ASPECT_RATIOS: tuple[tuple[str, float], ...] = (
+    ("1:1", 1.0),
+    ("16:9", 16 / 9),
+    ("4:3", 4 / 3),
+    ("3:2", 3 / 2),
+    ("2:3", 2 / 3),
+    ("3:4", 3 / 4),
+    ("9:16", 9 / 16),
+    ("21:9", 21 / 9),
+)
+
+
+def _to_minimax_aspect_ratio(size: str) -> str:
+    """Snap a ``WxH`` / ``W*H`` / ``W:H`` size onto MiniMax's aspect_ratio enum."""
+    value = (size or "").strip().lower().replace("*", "x").replace(" ", "")
+    if not value:
+        return "1:1"
+    if ":" in value:
+        left, _, right = value.partition(":")
+    else:
+        left, _, right = value.partition("x")
+    try:
+        ratio = float(left) / float(right)
+    except (ValueError, ZeroDivisionError):
+        return "1:1"
+    if ratio <= 0:
+        return "1:1"
+    return min(_MINIMAX_ASPECT_RATIOS, key=lambda item: abs(item[1] - ratio))[0]
 
 
 class ImageGenerationError(RuntimeError):
@@ -78,6 +111,9 @@ def image_endpoint_url(endpoint: EndpointConfig) -> str:
         return _append_path(endpoint.base_url, suffix)
     if api_type == "openai_images":
         return _append_path(endpoint.base_url, "/images/generations")
+    if api_type == "minimax":
+        # MiniMax serves generation under /v1/image_generation.
+        return _append_path(endpoint.base_url, "/image_generation")
     raise ImageGenerationError(f"Unsupported image API type: {endpoint.api_type}")
 
 
@@ -148,6 +184,27 @@ def build_image_request(
         body.update(_request_overrides(endpoint))
         return body
 
+    if api_type == "minimax":
+        # MiniMax has no negative_prompt field; fold it into the prompt the
+        # same way the OpenAI branch does. Prompt is capped at 1500 chars by
+        # the vendor, so truncate rather than let the API 400.
+        effective_prompt = prompt
+        if negative_prompt:
+            effective_prompt = f"{prompt}\nAvoid: {negative_prompt}"
+        body = {
+            "model": effective_model,
+            "prompt": effective_prompt[:1500],
+            "aspect_ratio": _to_minimax_aspect_ratio(effective_size),
+            "response_format": "url",
+            "n": 1,
+            "prompt_optimizer": bool(prompt_extend),
+            "aigc_watermark": bool(watermark),
+        }
+        if seed is not None:
+            body["seed"] = int(seed)
+        body.update(_request_overrides(endpoint))
+        return body
+
     raise ImageGenerationError(f"Unsupported image API type: {endpoint.api_type}")
 
 
@@ -198,6 +255,40 @@ def parse_image_response(endpoint: EndpointConfig, data: dict) -> ImageGeneratio
                 image_bytes=decoded,
             )
         raise ImageGenerationError("OpenAI Images response contained neither url nor b64_json")
+
+    if api_type == "minimax":
+        # MiniMax reports business failures inside a 200 response, so the
+        # status code has to be checked before looking for an image.
+        base_resp = data.get("base_resp") or {}
+        status_code = base_resp.get("status_code")
+        if status_code not in (None, 0):
+            raise ImageGenerationError(
+                f"MiniMax returned status_code={status_code}: {base_resp.get('status_msg')}"
+            )
+        payload = data.get("data") or {}
+        urls = payload.get("image_urls") or []
+        if urls:
+            return ImageGenerationResult(
+                endpoint_name=endpoint.name,
+                model=endpoint.model,
+                request_id=str(request_id) if request_id else None,
+                image_url=str(urls[0]),
+            )
+        b64_items = payload.get("image_base64") or payload.get("image_urls_base64") or []
+        if b64_items:
+            try:
+                decoded = base64.b64decode(b64_items[0], validate=True)
+            except (ValueError, TypeError) as exc:
+                raise ImageGenerationError("MiniMax returned invalid base64 image data") from exc
+            return ImageGenerationResult(
+                endpoint_name=endpoint.name,
+                model=endpoint.model,
+                request_id=str(request_id) if request_id else None,
+                image_bytes=decoded,
+            )
+        raise ImageGenerationError(
+            f"MiniMax response contained no image (metadata={data.get('metadata')!r})"
+        )
 
     raise ImageGenerationError(f"Unsupported image API type: {endpoint.api_type}")
 

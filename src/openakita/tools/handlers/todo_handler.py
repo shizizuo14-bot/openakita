@@ -22,6 +22,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ...core.policy_v2 import ApprovalClass
+from .todo_normalize import (
+    coerce_steps_payload,
+    normalize_step_description,
+    normalize_step_id,
+    normalize_task_summary,
+)
 from .todo_state import (
     _session_handlers,
     force_close_plan,
@@ -225,8 +231,9 @@ class PlanHandler:
 
     async def _create_todo(self, params: dict) -> str:
         """创建任务计划（支持多计划共存）"""
-        if "task_summary" not in params and "goal" in params:
-            params["task_summary"] = params.pop("goal")
+        # 模型常直接套用 Claude Code 的 TodoWrite 风格（title / steps[].step），
+        # 这里统一归一化，避免 task_summary 与 description 双双落空。
+        params["task_summary"] = normalize_task_summary(params)
 
         _plan = self._get_current_todo()
         if _plan and _plan.get("status") == "in_progress":
@@ -245,13 +252,8 @@ class PlanHandler:
 
         plan_id = f"plan_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(3)}"
 
-        steps = params.get("steps", [])
-        if isinstance(steps, str):
-            try:
-                steps = json.loads(steps)
-            except (json.JSONDecodeError, TypeError):
-                return "❌ steps 参数格式错误，需要 JSON 数组"
-        if not isinstance(steps, list):
+        steps = coerce_steps_payload(params.get("steps"))
+        if steps is None:
             return "❌ steps 参数格式错误，需要 JSON 数组"
         if len(steps) == 0:
             return "❌ 至少需要一个步骤才能创建计划"
@@ -263,14 +265,8 @@ class PlanHandler:
 
             step = dict(raw_step)
 
-            if "id" not in step or not str(step["id"]).strip():
-                step["id"] = f"step_{index + 1}"
-            else:
-                step["id"] = str(step["id"]).strip()[:64]
-            if "description" not in step or not str(step["description"]).strip():
-                step["description"] = step["id"]
-            else:
-                step["description"] = str(step["description"]).strip()[:512]
+            step["id"] = normalize_step_id(step, index)
+            step["description"] = normalize_step_description(step, index)
 
             for field_name in ("skills", "depends_on"):
                 field_value = step.get(field_name)
@@ -755,6 +751,7 @@ class PlanHandler:
             content = (
                 todo.get("content")
                 or todo.get("description")
+                or todo.get("step")  # Claude Code TodoWrite 风格
                 or todo.get("task")
                 or todo.get("title")
                 or ""

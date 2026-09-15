@@ -105,6 +105,7 @@ _INTERRUPT_BEHAVIOR_MAP: dict[str, InterruptBehavior] = {
     "ask_user": "cancel",  # already an awaiting-user state; cancel is fine
     "enable_thinking": "cancel",
     "generate_image": "block",  # external API call + file write
+    "generate_speech": "block",  # external TTS API call + audio file write
     "get_session_context": "cancel",
     "get_session_logs": "cancel",
     "get_tool_info": "cancel",

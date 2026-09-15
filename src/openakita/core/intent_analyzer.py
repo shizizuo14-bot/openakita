@@ -237,8 +237,49 @@ INTENT_ANALYZER_REPAIR_SYSTEM = (
 )
 
 
-def _strip_thinking_tags(text: str) -> str:
-    return re.sub(r"<thinking>.*?</thinking>", "", text, flags=re.DOTALL).strip()
+#: Reasoning blocks are spelled two different ways in the wild: ``<thinking>``
+#: (Anthropic-style) and ``<think>`` (MiniMax among others). The previous
+#: implementation only matched ``<thinking>``, so a ``<think>`` block survived
+#: normalization and the whole envelope was rejected by
+#: ``_validate_intent_yaml`` with ``non_yaml_text_at_line_1`` — which silently
+#: downgraded every request to the safe default on those providers.
+_THINK_BLOCK_RE = re.compile(
+    r"<think(?:ing)?(?:\s[^>]*)?>.*?</think(?:ing)?\s*>",
+    re.DOTALL | re.IGNORECASE,
+)
+_THINK_TAG_RE = re.compile(r"</?think(?:ing)?(?:\s[^>]*)?>", re.IGNORECASE)
+_CODE_FENCE_LINE_RE = re.compile(r"^\s*```.*$", re.MULTILINE)
+_INTENT_FIELD_LINE_RE = re.compile(r"^(\w[\w_]*):\s*(.*)$")
+
+
+def _normalize_compiler_output(text: str) -> str:
+    """Reduce raw compiler output to the flat YAML envelope the validator wants.
+
+    The compiler prompt asks for bare ``key: value`` lines, but real models wrap
+    the envelope in reasoning blocks and markdown fences, and may prepend prose.
+    :func:`_validate_intent_yaml` deliberately refuses to infer values from
+    prose, so all of that has to be removed *before* validation. Otherwise a
+    perfectly usable envelope gets rejected and the analyzer silently falls back
+    to :func:`_make_default`.
+    """
+    if not text:
+        return ""
+
+    cleaned = _THINK_BLOCK_RE.sub("", text)
+    # Unclosed reasoning blocks: drop the tag itself and let the field anchor
+    # below discard the leftover reasoning lines.
+    cleaned = _THINK_TAG_RE.sub("", cleaned)
+    cleaned = _CODE_FENCE_LINE_RE.sub("", cleaned)
+
+    # Anchor on the first line that opens an allowed field. Anything before it
+    # is preamble; the envelope from that point on is still validated strictly.
+    lines = cleaned.splitlines()
+    for index, line in enumerate(lines):
+        match = _INTENT_FIELD_LINE_RE.match(line.strip())
+        if match and match.group(1) in _INTENT_ALLOWED_FIELDS:
+            return "\n".join(lines[index:]).strip()
+
+    return cleaned.strip()
 
 
 _ACTION_VERB_RE = re.compile(
@@ -394,7 +435,9 @@ class IntentAnalyzer:
                 max_tokens=INTENT_ANALYZER_MAX_TOKENS,
             )
 
-            raw_output = _strip_thinking_tags(response.content).strip() if response.content else ""
+            raw_output = (
+                _normalize_compiler_output(response.content) if response.content else ""
+            )
             valid, validation_error = _validate_intent_yaml(raw_output)
             if not valid:
                 logger.warning(
@@ -411,7 +454,7 @@ class IntentAnalyzer:
                     max_tokens=INTENT_ANALYZER_MAX_TOKENS,
                 )
                 repaired_output = (
-                    _strip_thinking_tags(repair_response.content).strip()
+                    _normalize_compiler_output(repair_response.content)
                     if repair_response.content
                     else ""
                 )

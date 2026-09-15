@@ -36,6 +36,7 @@ class SystemHandler:
         "get_session_logs",
         "get_tool_info",
         "generate_image",
+        "generate_speech",
         "set_task_timeout",
         "get_workspace_map",
     ]
@@ -49,6 +50,8 @@ class SystemHandler:
         # generate_image 是网络出站调用 + 写盘（image gen API），归 NETWORK_OUT；
         # 实际写文件路径在 cwd，不算 mutating（不是用户文件）
         "generate_image": ApprovalClass.NETWORK_OUT,
+        # generate_speech 同理：网络出站 TTS 调用 + 落盘音频
+        "generate_speech": ApprovalClass.NETWORK_OUT,
         "set_task_timeout": ApprovalClass.CONTROL_PLANE,
         "get_workspace_map": ApprovalClass.READONLY_GLOBAL,
     }
@@ -74,6 +77,8 @@ class SystemHandler:
             return self._get_tool_info(params)
         elif tool_name == "generate_image":
             return await self._generate_image(params)
+        elif tool_name == "generate_speech":
+            return await self._generate_speech(params)
         elif tool_name == "set_task_timeout":
             return self._set_task_timeout(params)
         elif tool_name == "get_workspace_map":
@@ -375,6 +380,148 @@ class SystemHandler:
         if failures:
             return "❌ 所有图片生成端点均失败:\n" + "\n".join(f"- {x}" for x in failures) + _hint
         return f"❌ 没有可用的图片生成端点{_hint}"
+
+    _GENERATE_SPEECH_FAIL_HINT = (
+        "\n[行为指引] 语音合成接口暂时不可用，请直接将上述失败原因告知用户。"
+        "不要尝试用 run_shell、本地 TTS 库或任何其他方式替代合成语音。"
+    )
+
+    async def _generate_speech(self, params: dict) -> str:
+        """Synthesize speech through configured TTS providers and save it locally."""
+        import json
+        import re
+        import time
+
+        import httpx
+
+        from ...config import settings
+        from ...llm.tts_client import (
+            TTSError,
+            load_tts_endpoints,
+            request_speech,
+            select_tts_endpoints,
+        )
+
+        _hint = self._GENERATE_SPEECH_FAIL_HINT
+
+        text = (params.get("text") or "").strip()
+        if not text:
+            return "❌ text 不能为空"
+
+        requested_endpoint = (params.get("endpoint") or "").strip()
+        model = (params.get("model") or "").strip()
+        voice_id = (params.get("voice_id") or "").strip()
+        emotion = (params.get("emotion") or "").strip()
+        audio_format = (params.get("audio_format") or "").strip()
+        language_boost = (params.get("language_boost") or "").strip()
+        speed = params.get("speed")
+        vol = params.get("vol")
+        pitch = params.get("pitch")
+        output_path = (params.get("output_path") or "").strip()
+
+        endpoints = load_tts_endpoints(settings.project_root)
+        if not endpoints:
+            return (
+                "❌ 未配置语音合成端点，请在 data/llm_endpoints.json 的 "
+                f"tts_endpoints 中添加{_hint}"
+            )
+
+        try:
+            candidates = select_tts_endpoints(endpoints, requested_endpoint)
+        except TTSError as exc:
+            return f"❌ {exc}{_hint}"
+
+        from ...llm.providers.proxy_utils import extract_connection_error, get_httpx_client_kwargs
+
+        async def _download_audio(url: str) -> bytes:
+            async with httpx.AsyncClient(
+                **get_httpx_client_kwargs(timeout=60), follow_redirects=True
+            ) as dl_client:
+                resp = await dl_client.get(url)
+                resp.raise_for_status()
+                return resp.content
+
+        t0 = time.time()
+        failures: list[str] = []
+        async with httpx.AsyncClient(
+            **get_httpx_client_kwargs(timeout=180), follow_redirects=True
+        ) as client:
+            for endpoint in candidates:
+                try:
+                    result = await request_speech(
+                        client,
+                        endpoint,
+                        text=text,
+                        model=model,
+                        voice_id=voice_id,
+                        speed=float(speed) if speed not in (None, "") else None,
+                        vol=float(vol) if vol not in (None, "") else None,
+                        pitch=int(pitch) if pitch not in (None, "") else None,
+                        emotion=emotion,
+                        audio_format=audio_format,
+                        language_boost=language_boost,
+                    )
+                    if result.audio_bytes is not None:
+                        audio_bytes = result.audio_bytes
+                    elif result.audio_url:
+                        audio_bytes = await _download_audio(result.audio_url)
+                    else:
+                        raise TTSError("provider returned no audio payload")
+
+                    from ...core.working_directory import (
+                        current_working_directory,
+                        resolve_working_path,
+                    )
+
+                    suffix = result.audio_format or "mp3"
+                    if output_path:
+                        out_path = resolve_working_path(output_path)
+                    else:
+                        stamp = result.request_id or str(int(time.time()))
+                        safe_model = re.sub(r"[^A-Za-z0-9._-]+", "_", result.model)[:80]
+                        out_path = (
+                            current_working_directory(require_available=True)
+                            / f"{safe_model}_{stamp}.{suffix}"
+                        )
+                    out_path.parent.mkdir(parents=True, exist_ok=True)
+                    out_path.write_bytes(audio_bytes)
+                except Exception as exc:  # noqa: BLE001 - each provider participates in fallback
+                    detail = (
+                        extract_connection_error(exc)
+                        if isinstance(exc, httpx.HTTPError)
+                        else str(exc)
+                    )
+                    failures.append(f"{endpoint.name}: {detail}")
+                    logger.warning("generate_speech endpoint failed: %s", failures[-1])
+                    continue
+
+                elapsed_ms = int((time.time() - t0) * 1000)
+                extra = result.extra_info or {}
+                effective_voice = voice_id or str(
+                    (endpoint.extra_params or {}).get("default_voice_id") or ""
+                )
+                return json.dumps(
+                    {
+                        "ok": True,
+                        "endpoint": result.endpoint_name,
+                        "model": result.model,
+                        "voice_id": effective_voice,
+                        "audio_url": result.audio_url,
+                        "saved_to": str(out_path),
+                        "audio_format": result.audio_format,
+                        "duration_ms": extra.get("audio_length"),
+                        "size_bytes": out_path.stat().st_size,
+                        "request_id": result.request_id,
+                        "elapsed_ms": elapsed_ms,
+                        "hint": "如需把音频真正交付给用户，请继续调用 deliver_artifacts(artifacts=[{type:'audio', path:saved_to}])。仅调用一次，不要只在文字里说音频已发送。",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
+        if failures:
+            return "❌ 所有语音合成端点均失败:\n" + "\n".join(f"- {x}" for x in failures) + _hint
+        return f"❌ 没有可用的语音合成端点{_hint}"
 
 
 def create_handler(agent: "Agent"):

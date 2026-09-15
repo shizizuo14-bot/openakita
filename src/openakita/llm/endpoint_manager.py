@@ -29,6 +29,9 @@ _ENDPOINT_LISTS = (
     # from chat endpoints because generation APIs use different payloads and
     # response shapes even when the provider also exposes an OpenAI chat API.
     "image_endpoints",
+    # Dedicated text-to-speech providers. Same reasoning as image_endpoints:
+    # /v1/t2a_v2 returns hex-encoded audio, not a chat completion.
+    "tts_endpoints",
     # "relay_endpoints" holds shared relay / aggregator targets that
     # plugins (happyhorse-video, tongyi-image, avatar-studio, ...)
     # can reference by name instead of re-pasting base_url + api_key
@@ -657,6 +660,7 @@ class EndpointManager:
             "compiler_endpoints": [],
             "stt_endpoints": [],
             "image_endpoints": [],
+            "tts_endpoints": [],
             "relay_endpoints": [],
             "settings": {},
         }

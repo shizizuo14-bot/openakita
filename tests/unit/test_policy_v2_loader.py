@@ -200,10 +200,17 @@ security:
 
         cfg, report = load_policies_yaml(real)
         assert isinstance(cfg, PolicyConfigV2)
-        # The checked-in file may be either legacy v1 or a transitional
-        # v1/v2 mix while the policy_v2 migration remains backwards-compatible.
-        assert report.schema_detected in {"v1", "mixed"}
-        assert report.has_changes()
+        # The checked-in file may be legacy v1, a transitional v1/v2 mix, or a
+        # fully migrated v2 (the recommended state once an operator has run the
+        # migration). All three must load.
+        assert report.schema_detected in {"v1", "mixed", "v2"}
+        if report.schema_detected == "v2":
+            # Nothing left to migrate, and a v2 file must round-trip without
+            # losing or conflicting over any security field.
+            assert report.fields_dropped == []
+            assert report.conflicts == []
+        else:
+            assert report.has_changes()
 
     def test_invalid_yaml_returns_defaults(self, tmp_path: Path) -> None:
         p = tmp_path / "bad.yaml"

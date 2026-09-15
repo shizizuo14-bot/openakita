@@ -114,15 +114,31 @@ def _resolve_env_vars(value: str, env_values: dict[str, str] | None = None) -> s
     )
 
 
-def _resolve_headers(raw: dict, env_values: dict[str, str] | None = None) -> dict[str, str]:
-    """Resolve env-var placeholders in header values, dropping empty ones."""
+def _resolve_headers(
+    raw: dict,
+    env_values: dict[str, str] | None = None,
+    *,
+    warn: bool = True,
+) -> dict[str, str]:
+    """Resolve env-var placeholders in header values, dropping empty ones.
+
+    ``warn=False`` is used while browsing bundled catalog entries that are not
+    auto-connected. A server that is merely *listed* (``autoConnect: false``)
+    must not log a WARNING just because its token has not been configured yet —
+    that reads like a fault report for a feature the user never enabled.
+    """
     resolved: dict[str, str] = {}
     for k, v in raw.items():
         val = _resolve_env_vars(str(v), env_values)
         if val:
             resolved[k] = val
-        else:
+        elif warn:
             logger.warning("MCP header %s resolved to empty (env var not set?), skipping", k)
+        else:
+            logger.debug(
+                "MCP header %s resolved to empty (env var not set, not auto-connecting), skipping",
+                k,
+            )
     return resolved
 
 
@@ -309,8 +325,10 @@ Use `connect_mcp_server(server)` to connect a server and discover its tools.
                 transport = "sse"
             url = metadata.get("url", "")
             raw_headers = metadata.get("headers") or {}
-            headers = _resolve_headers(raw_headers, env_values)
             auto_connect = metadata.get("autoConnect", False)
+            # Only warn about unresolved header placeholders for servers that
+            # actually intend to connect; the rest are just catalog entries.
+            headers = _resolve_headers(raw_headers, env_values, warn=bool(auto_connect))
             if auto_connect and raw_headers and len(headers) < len(raw_headers):
                 logger.info(
                     "MCP server %s autoConnect disabled until required header env vars are configured",

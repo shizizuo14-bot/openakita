@@ -11,13 +11,14 @@
 import asyncio
 import contextlib
 import inspect
+import json
 import logging
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from ..channels.base import ChannelDeliveryUnavailable
-from ..memory.json_utils import coerce_text
+from ..memory.json_utils import coerce_text, extract_json_array, loads_llm_json
 from .delivery import allows_global_im_fallback, is_im_delivery_channel
 from .task import ScheduledTask
 
@@ -25,6 +26,39 @@ logger = logging.getLogger(__name__)
 
 CHANNEL_UNAVAILABLE_MARKER = "[channel_unavailable]"
 CHANNEL_UNAVAILABLE_MESSAGE = "IM 通道不可投递：微信会话或 context_token 已失效，请在微信中发送一条新消息刷新会话，或重新扫码登录。"
+
+
+def _parse_nudge_memories(raw: str) -> tuple[list | None, str]:
+    """从 memory nudge 的 LLM 响应中尽力抽出记忆数组。
+
+    返回 ``(memories, reason)``：``memories`` 为 ``None`` 表示没有可恢复的
+    JSON 数组，此时 ``reason`` 带一句简短诊断供日志使用。
+
+    共享 helper 会先剥掉 provider 的推理包装（MiniMax ``<think>`` / Claude
+    ``<thinking>``），因此模型**推理时**随口写的 JSON schema 示例不可能被
+    当成答案返回 —— 这正是旧内联正则
+    ``r"\\[\\s*(?:\\{.*?\\}\\s*,?\\s*)*\\]"`` 的缺陷：它会把示例里的占位文本
+    当成真实记忆写进去。
+    """
+    if not raw.strip():
+        return None, "empty response"
+
+    array_text = extract_json_array(raw)
+    candidates = [raw]
+    if array_text and array_text != raw:
+        candidates.append(array_text)
+
+    first_error = ""
+    for candidate in candidates:
+        try:
+            parsed = loads_llm_json(candidate)
+        except json.JSONDecodeError as exc:
+            first_error = first_error or str(exc)
+            continue
+        if isinstance(parsed, list):
+            return parsed, "ok"
+        first_error = first_error or f"non-list JSON ({type(parsed).__name__})"
+    return None, first_error or "no JSON array found"
 
 
 class TaskExecutor:
@@ -1259,48 +1293,45 @@ class TaskExecutor:
                 response = await brain.think_lightweight(review_prompt, max_tokens=2048)
             finally:
                 reset_tracking_context(_tracking_token)
-            raw = response.content.strip()
+            raw = coerce_text(response.content).strip()
 
-            import json
-            import re as _re
-
-            if raw.startswith("```"):
-                raw = raw.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-
-            # Fix-7：best-effort JSON 解析。
+            # Fix-7（续）：best-effort JSON 解析。
             # 旧实现 json.loads(raw) 一遇到 LLM 返回的非法 JSON（哪怕只是
             # 多了一行 prose/单条尾随逗号）就抛 JSONDecodeError，导致整个
             # nudge 任务失败 → fail_count + missed_count 持续累积。
             #
-            # 新策略（仍然保守）：
-            #   1. 直接 loads 成功 → 用结果；
-            #   2. 失败 → 抓出第一个 [ ... ] JSON 数组重新尝试；
-            #   3. 仍失败 → 不视为任务失败，记 warning 并返回成功 +
-            #      "skipped" 信息，让 scheduler 不再累积失败计数。
-            memories: list | None = None
-            try:
-                memories = json.loads(raw)
-            except json.JSONDecodeError as e:
+            # 解析本身（含推理包装剥离与数组抽取）已抽到
+            # :func:`_parse_nudge_memories`，便于单测覆盖。
+            #
+            # 解析失败 → 不视为任务失败，记 warning 并返回成功 + "skipped"
+            # 信息，让 scheduler 不再累积失败计数。
+            #
+            # 注意：修复成功属于常规路径，不再打 WARNING。旧实现在第一次
+            # json.loads 失败时就告警，但紧接着往往就解析成功了（2026-09-15
+            # serve.log:375 告警 / :377 "extracted 3 memories"），日志里因此
+            # 长期挂着一条并不代表故障的"失败"记录。
+            memories, parse_reason = _parse_nudge_memories(raw)
+            if memories is None:
                 logger.warning(
-                    "[memory_nudge] LLM returned non-JSON, attempting array "
-                    "extraction (err=%s, raw_preview=%r)",
-                    str(e)[:120],
+                    "[memory_nudge] LLM output contained no recoverable JSON "
+                    "array, skipping this round (reason=%s, raw_preview=%r)",
+                    parse_reason[:120],
                     raw[:200],
                 )
-                m = _re.search(r"\[\s*(?:\{.*?\}\s*,?\s*)*\]", raw, _re.DOTALL)
-                if m:
-                    try:
-                        memories = json.loads(m.group(0))
-                    except json.JSONDecodeError:
-                        memories = None
-                if memories is None:
-                    return (
-                        True,
-                        "LLM returned malformed JSON; skipping this round "
-                        "(no failure count, will retry next interval).",
-                    )
-            if not isinstance(memories, list):
-                return True, "LLM returned non-list response, skipping"
+                return (
+                    True,
+                    "LLM returned malformed JSON; skipping this round "
+                    "(no failure count, will retry next interval).",
+                )
+            if "<think" in raw.lower():
+                # 静默但可诊断：这条只在 DEBUG 级别出现，用来确认推理块剥离
+                # 确实被走到了（生产默认 INFO 级别不会打印）。
+                logger.debug(
+                    "[memory_nudge] Parsed %d memories after stripping provider "
+                    "reasoning wrapper(s) from a %d-char response",
+                    len(memories),
+                    len(raw),
+                )
 
             from ..memory.types import Memory, MemoryPriority, MemoryType
 

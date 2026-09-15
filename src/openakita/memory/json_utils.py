@@ -75,17 +75,29 @@ def coerce_tool_names(value: Any) -> list[str]:
 
 
 def extract_json_array(text: str) -> str | None:
-    """Extract the first JSON array-like block from LLM output."""
+    """Extract the first JSON array-like block from LLM output.
+
+    Provider reasoning wrappers (``<think>`` / ``<thinking>``) are stripped
+    first, so a JSON snippet the model was merely *reasoning about* can never
+    be mistaken for the answer. See :func:`_strip_reasoning_blocks`.
+    """
     return _extract_json_block(text, "[", "]")
 
 
 def extract_json_object(text: str) -> str | None:
-    """Extract the first JSON object-like block from LLM output."""
+    """Extract the first JSON object-like block from LLM output.
+
+    Reasoning wrappers are stripped first, same as :func:`extract_json_array`.
+    """
     return _extract_json_block(text, "{", "}")
 
 
 def loads_llm_json(text: str) -> Any:
-    """Parse JSON emitted by an LLM with conservative repair passes."""
+    """Parse JSON emitted by an LLM with conservative repair passes.
+
+    Handles reasoning wrappers, code fences and trailing commas. Raises
+    :class:`json.JSONDecodeError` only when no valid JSON can be recovered.
+    """
     cleaned = _clean_llm_json_text(text)
     try:
         return json.loads(cleaned)
@@ -158,8 +170,34 @@ def _format_plugin_event(value_type: str, data: Any) -> str:
     return summary
 
 
+def _strip_reasoning_blocks(text: str) -> str:
+    """Drop provider reasoning wrappers before looking for JSON.
+
+    MiniMax emits ``<think>...</think>`` (Claude uses ``<thinking>``) ahead of
+    the real answer. Those blocks routinely contain JSON *examples* the model is
+    reasoning about -- including the very schema it was asked to produce. A
+    naive "find the first ``[ ... ]``" scan would return such a snippet as if it
+    were the answer, silently persisting placeholder text as real data.
+
+    ``core.response_handler.strip_thinking_tags`` is the canonical strip
+    implementation (it also handles MiniMax / Kimi K2 tool-call sections and
+    unclosed tags). It is imported lazily so this low-level module keeps no
+    import-time dependency on :mod:`openakita.core`, matching how
+    ``core.stream_accumulator`` pulls the same helper in.
+    """
+    if not text:
+        return ""
+    # Cheap fast path: most payloads carry no reasoning wrapper at all.
+    if "<think" not in text.lower():
+        return text
+
+    from ..core.response_handler import strip_thinking_tags
+
+    return strip_thinking_tags(text)
+
+
 def _clean_llm_json_text(text: str) -> str:
-    cleaned = coerce_text(text).strip()
+    cleaned = _strip_reasoning_blocks(coerce_text(text)).strip()
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s*```$", "", cleaned)
     cleaned = re.sub(r",(\s*[}\]])", r"\1", cleaned)
@@ -167,7 +205,7 @@ def _clean_llm_json_text(text: str) -> str:
 
 
 def _extract_json_block(text: str, opener: str, closer: str) -> str | None:
-    cleaned = coerce_text(text).strip()
+    cleaned = _strip_reasoning_blocks(coerce_text(text)).strip()
     fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", cleaned, flags=re.IGNORECASE)
     if fenced:
         fenced_text = fenced.group(1).strip()

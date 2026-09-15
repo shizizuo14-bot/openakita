@@ -160,6 +160,7 @@ CATEGORY_PREFIXES = {
         "get_session_logs",
         "get_tool_info",
         "generate_image",
+        "generate_speech",
         "set_task_timeout",
         "get_workspace_map",
         "get_session_context",

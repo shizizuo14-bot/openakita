@@ -14,6 +14,12 @@ from datetime import datetime
 from pathlib import Path
 
 from ...utils.atomic_io import atomic_json_write, read_json_safe
+from .todo_normalize import (
+    coerce_steps_payload,
+    normalize_step_description,
+    normalize_step_id,
+    normalize_task_summary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,13 +112,14 @@ class TodoStore:
 
     def _rebuild_plan_from_create_todo(self, tool_input: dict) -> dict:
         """从 create_todo 的工具参数重建 plan 结构"""
+        raw_steps = coerce_steps_payload(tool_input.get("steps")) or []
         steps = []
-        for i, raw in enumerate(tool_input.get("steps", [])):
+        for i, raw in enumerate(raw_steps):
             if isinstance(raw, dict):
                 steps.append(
                     {
-                        "id": raw.get("id", f"step_{i + 1}"),
-                        "description": raw.get("description", ""),
+                        "id": normalize_step_id(raw, i),
+                        "description": normalize_step_description(raw, i),
                         "status": "pending",
                         "result": "",
                         "started_at": None,
@@ -123,7 +130,7 @@ class TodoStore:
                 )
         return {
             "id": f"restored_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-            "task_summary": tool_input.get("task_summary", ""),
+            "task_summary": normalize_task_summary(tool_input),
             "status": "in_progress",
             "steps": steps,
             "created_at": datetime.now().isoformat(),
